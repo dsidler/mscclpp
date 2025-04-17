@@ -43,12 +43,12 @@ size_t maxBytes = 32 * 1024 * 1024;
 size_t stepBytes = 1 * 1024 * 1024;
 size_t stepFactor = 1;
 int datacheck = 1;
-int warmup_iters = 10;
-int iters = 20;
+size_t warmup_iters = 10;
+size_t iters = 20;
 // Report average iteration time: (0=RANK0,1=AVG,2=MIN,3=MAX)
 int average = 1;
 int kernel_num = 0;
-int cudaGraphLaunches = 15;
+size_t cudaGraphLaunches = 15;
 std::string output_file;
 
 double parseSize(const char* value) {
@@ -157,6 +157,8 @@ void validateArgsForDeviceKernel(const std::vector<KernelRestriction>& restricti
 
 int getDeviceNumaNode(int cudaDev) {
   std::string busId = getBusId(cudaDev);
+  // Required for CPX
+  busId[busId.length() - 1] = '0';
   std::string file_str = "/sys/bus/pci/devices/" + busId + "/numa_node";
   std::ifstream file(file_str);
   int numaNode;
@@ -203,7 +205,7 @@ double BaseTestEngine::benchTime() {
   cudaGraphExec_t graphExec;
   CUDATHROW(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
   mscclpp::Timer timer;
-  for (int iter = 0; iter < iters; iter++) {
+  for (size_t iter = 0; iter < iters; iter++) {
     coll_->runColl(args_, stream_);
   }
   CUDATHROW(cudaStreamEndCapture(stream_, &graph));
@@ -211,7 +213,7 @@ double BaseTestEngine::benchTime() {
 
   this->barrier();
   timer.reset();
-  for (int l = 0; l < cudaGraphLaunches; ++l) {
+  for (size_t l = 0; l < cudaGraphLaunches; ++l) {
     CUDATHROW(cudaGraphLaunch(graphExec, stream_));
   }
   CUDATHROW(cudaStreamSynchronize(stream_));
@@ -232,7 +234,7 @@ void BaseTestEngine::runTest() {
   this->barrier();
   validateArgsForDeviceKernel(coll_->getKernelRestrictions(), args_.kernelNum, coll_->getParamBytes() / sizeof(int),
                               args_.totalRanks, args_.nRanksPerNode);
-  for (int iter = 0; iter < warmup_iters; iter++) {
+  for (size_t iter = 0; iter < warmup_iters; iter++) {
     this->coll_->runColl(args_, stream_);
   }
   CUDATHROW(cudaDeviceSynchronize());
@@ -242,7 +244,7 @@ void BaseTestEngine::runTest() {
   this->barrier();
   validateArgsForDeviceKernel(coll_->getKernelRestrictions(), args_.kernelNum, coll_->getParamBytes() / sizeof(int),
                               args_.totalRanks, args_.nRanksPerNode);
-  for (int iter = 0; iter < warmup_iters; iter++) {
+  for (size_t iter = 0; iter < warmup_iters; iter++) {
     this->coll_->runColl(args_, stream_);
   }
   CUDATHROW(cudaDeviceSynchronize());
@@ -582,16 +584,16 @@ int main(int argc, char* argv[]) {
         stepFactor = strtol(optarg, NULL, 0);
         break;
       case 'n':
-        iters = (int)strtol(optarg, NULL, 0);
+        iters = std::stoull(optarg, NULL, 0);
         break;
       case 'w':
-        warmup_iters = (int)strtol(optarg, NULL, 0);
+        warmup_iters = std::stoull(optarg, NULL, 0);
         break;
       case 'c':
-        datacheck = (int)strtol(optarg, NULL, 0);
+        datacheck = (size_t)strtol(optarg, NULL, 0);
         break;
       case 'G':
-        cudaGraphLaunches = strtol(optarg, NULL, 0);
+        cudaGraphLaunches = std::stoull(optarg, NULL, 0);
         if (cudaGraphLaunches <= 0) {
           fprintf(stderr, "invalid number for 'cudaGraphLaunches'\n");
           return -1;

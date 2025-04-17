@@ -297,11 +297,11 @@ __global__ void __launch_bounds__(1024, 1)
     }
   }
 
-  __syncthreads();
-  if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
-    scratchChans[threadIdx.x].signal();
-    scratchChans[threadIdx.x].wait();
-  }
+    __syncthreads();
+    if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
+      scratchChans[threadIdx.x].signal();
+      scratchChans[threadIdx.x].wait();
+    }
 
 }
 
@@ -387,7 +387,7 @@ __global__ void __launch_bounds__(1024, 1)
       }
     }
 
-    prodFlag = !prodFlag;
+      prodFlag = !prodFlag;
     if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
       scratchChans[threadIdx.x].wait();
     }
@@ -442,6 +442,143 @@ __global__ void __launch_bounds__(1024, 1)
       scratchChans[threadIdx.x].signal();
       scratchChans[threadIdx.x].wait();
     }
+}
+
+// Hierarchical pull-based implementation
+// No-overlap between phases
+// Assume out-of-place
+__global__ void __launch_bounds__(512, 1)
+    reducescatter8(int* buff, int* resultBuff, size_t rank, [[maybe_unused]] size_t worldSize, size_t nRanksPerNode,
+                   size_t nelems) {
+  const size_t nBlock = gridDim.x;
+  if (blockIdx.x >= nBlock) return;
+
+  const size_t nPeer = worldSize - 1;
+  const size_t nNodes = 8;
+  const size_t nLocalRanks = nRanksPerNode;// / nNodes;
+  const size_t nLocalPeers = nLocalRanks - 1;
+  const size_t nRemotePeers = nNodes - 1;
+
+  const size_t chanOffset = nPeer * blockIdx.x;
+  auto memChans = constMemChans + chanOffset;
+
+  const size_t nInt4 = nelems * sizeof(int) / sizeof(int4);
+  const size_t nInt4PerRank = nInt4 / worldSize;
+  const size_t nInt4PerLocalRank = nInt4PerRank * nNodes;
+  const size_t nInt4PerNode = nInt4PerRank * nLocalRanks;
+  const size_t nodeId = rank / nRanksPerNode;
+  const size_t localRank = rank % nRanksPerNode;
+
+  int4* buff4 = reinterpret_cast<int4*>(buff);
+  int4* resultBuff4 = reinterpret_cast<int4*>(resultBuff);
+
+  // Distribute `nInt4PerRank` across all blocks with the unit size `unitNInt4`
+  constexpr size_t unitNInt4 = 512;
+  const size_t maxNInt4PerBlock =
+      (((nInt4PerRank + gridDim.x - 1) / gridDim.x) + unitNInt4 - 1) / unitNInt4 * unitNInt4;
+  size_t offsetOfThisBlock = maxNInt4PerBlock * blockIdx.x;
+  size_t nInt4OfThisBlock = maxNInt4PerBlock;
+  size_t nNeededBlocks = (nInt4PerRank + maxNInt4PerBlock - 1) / maxNInt4PerBlock;
+  // constexpr size_t nInt4PerChunk = 1024 * 256 / sizeof(int4);  // 256KB
+  // Use smaller chunk size for inner collective
+  constexpr size_t nInt4PerChunk = 1024 * 64 / sizeof(int4);
+  constexpr size_t nInt4PerOuterChunk = nInt4PerChunk * nNodes;
+
+  if (blockIdx.x >= nNeededBlocks) {
+    nInt4OfThisBlock = 0;
+  } else if (blockIdx.x == nNeededBlocks - 1) {
+    nInt4OfThisBlock = nInt4PerRank - maxNInt4PerBlock * (nNeededBlocks - 1);
+  }
+
+  const size_t nItrs = nInt4OfThisBlock / nInt4PerChunk;
+  const size_t restNInt4 = nInt4OfThisBlock % nInt4PerChunk;
+
+  if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
+    memChans[threadIdx.x].relaxedSignal();
+    memChans[threadIdx.x].wait();
+  }
+  __syncthreads();
+
+  // Local ReduceScatter
+  for (size_t i = 0; i < nItrs; ++i) {
+    for (size_t nodeIdx = 0; nodeIdx < nNodes; nodeIdx++) {
+      for (size_t idx = threadIdx.x; idx < nInt4PerChunk; idx += blockDim.x) {
+        int4 data = buff4[(nInt4PerNode * nodeIdx) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx];
+        // #pragma unroll
+        for (size_t localPeerIdx = 0; localPeerIdx < nLocalPeers; localPeerIdx++) {
+          const size_t peerIdx = (nodeId * nLocalRanks) + localPeerIdx;
+          int4 val = memChans[peerIdx].read<int4>((nInt4PerNode * nodeIdx) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx);
+          data = add_vectors<int>(val, data);
+        }
+        buff4[(nInt4PerNode * nodeIdx) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx] = data;
+      }
+    }
+    offsetOfThisBlock += nInt4PerChunk;
+  }
+
+  if (restNInt4 > 0) {
+    for (size_t nodeIdx = 0; nodeIdx < nNodes; nodeIdx++) {
+      for (size_t idx = threadIdx.x; idx < restNInt4; idx += blockDim.x) {
+        int4 data = buff4[(nInt4PerNode * nodeIdx) + nInt4PerRank * localRank + offsetOfThisBlock + idx];
+        // #pragma unroll
+        for (size_t localPeerIdx = 0; localPeerIdx < nLocalPeers; localPeerIdx++) {
+          const size_t peerIdx = (nodeId * nLocalRanks) + localPeerIdx;
+          int4 val = memChans[peerIdx].read<int4>((nInt4PerNode * nodeIdx) + nInt4PerRank * localRank + offsetOfThisBlock + idx);
+          data = add_vectors<int>(val, data);
+        }
+        buff4[(nInt4PerNode * nodeIdx) + nInt4PerRank * localRank + offsetOfThisBlock + idx] = data;
+      }
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
+    memChans[threadIdx.x].signal();
+    memChans[threadIdx.x].wait();
+  }
+  __syncthreads();
+
+
+  offsetOfThisBlock = maxNInt4PerBlock * blockIdx.x;
+  // Global ReduceScatter
+  for (size_t i = 0; i < nItrs; ++i) {
+    for (size_t idx = threadIdx.x; idx < nInt4PerChunk; idx += blockDim.x) {
+      int4 data = buff4[(nInt4PerNode * nodeId) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx];
+      // #pragma unroll
+      for (size_t remotePeerIdx = 0; remotePeerIdx < nRemotePeers; remotePeerIdx++) {
+        const size_t peerNodeIdx = (remotePeerIdx < nodeId) ? remotePeerIdx : (remotePeerIdx + 1);
+        size_t peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
+        if (peerIdx > rank) peerIdx--;
+        int4 val = memChans[peerIdx].read<int4>((nInt4PerNode * nodeId) + (nInt4PerRank * localRank) +
+                                                offsetOfThisBlock + idx);
+        data = add_vectors<int>(val, data);
+      }
+      resultBuff4[offsetOfThisBlock + idx] = data;
+    }
+    offsetOfThisBlock += nInt4PerChunk;
+  }
+
+  if (restNInt4 > 0) {
+    for (size_t idx = threadIdx.x; idx < restNInt4; idx += blockDim.x) {
+      int4 data = buff4[(nInt4PerNode * nodeId) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx];
+      // #pragma unroll
+      for (size_t remotePeerIdx = 0; remotePeerIdx < nRemotePeers; remotePeerIdx++) {
+        const size_t peerNodeIdx = (remotePeerIdx < nodeId) ? remotePeerIdx : (remotePeerIdx + 1);
+        size_t peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
+        if (peerIdx > rank) peerIdx--;
+        int4 val = memChans[peerIdx].read<int4>((nInt4PerNode * nodeId) + nInt4PerRank * localRank +
+                                                offsetOfThisBlock + idx);
+        data = add_vectors<int>(val, data);
+      }
+      resultBuff4[offsetOfThisBlock + idx] = data;
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
+    memChans[threadIdx.x].signal();
+    memChans[threadIdx.x].wait();
+  }
 }
 
 // Experimental pull-based implementation
@@ -610,6 +747,9 @@ void ReduceScatterTestColl::runColl(const TestArgs& args, cudaStream_t stream) {
   } else if (kernelNum == 7) {
     nBlocks = 32;
     nThreads = 1024;
+  } else if (kernelNum == 8) {
+    nBlocks = 8;
+    nThreads = 256;
   } else if (kernelNum == 9) {
     nBlocks = 16;
     nThreads = 512;//(WARP_SIZE);
@@ -626,6 +766,8 @@ void ReduceScatterTestColl::runColl(const TestArgs& args, cudaStream_t stream) {
   } else if (kernelNum == 7) {
     reducescatter7<<<nBlocks, nThreads, 0, stream>>>((int*)inputBuff, (int*)scratchBuff, (int*)outputBuff, rank, worldSize,
     nRanksPerNode, paramCount_);
+  } else if (kernelNum == 8) {
+    reducescatter8<<<nBlocks, nThreads, 0, stream>>>((int*)inputBuff, (int*)outputBuff, rank, worldSize, 8, paramCount_);
   } else if (kernelNum == 9) {
     reducescatter9<<<nBlocks, nThreads, 0, stream>>>((int*)inputBuff, (int*)outputBuff, rank, worldSize, nRanksPerNode, paramCount_);
   }
@@ -671,6 +813,7 @@ std::vector<KernelRestriction> ReduceScatterTestColl::getKernelRestrictions() {
           {5, "reducescatter5", false, 1, 16 * worldSize_ /*use ulong2 to transfer data*/},
           {6, "reducescatter6", false, 1, 16 * worldSize_ /*use ulong2 to transfer data*/},
           {7, "reducescatter7", false, 1, 16 * worldSize_ /*use ulong2 to transfer data*/},
+          {8, "reducescatter8", false, 1, 16 * worldSize_ /*use ulong2 to transfer data*/},
           {9, "reducescatter9", false, 1, 16 * worldSize_ /*use ulong2 to transfer data*/}};
 }
 
@@ -724,7 +867,7 @@ void ReduceScatterTestEngine::allocateBuffer() {
 }
 
 void ReduceScatterTestEngine::setupConnections() {
-  setupMeshConnections(smChannels_, sendBuff_.get(), args_.maxBytes, nullptr, 0, ChannelSemantic::PUT, 64);
+  setupMeshConnections(smChannels_, sendBuff_.get(), args_.maxBytes, nullptr, 0, ChannelSemantic::PUT, 8);
   std::vector<DeviceHandle<mscclpp::MemoryChannel>> smChannelHandles(smChannels_.size());
   if (smChannels_.size() > sizeof(constMemChans) / sizeof(DeviceHandle<mscclpp::MemoryChannel>)) {
     std::runtime_error("unexpected error");
