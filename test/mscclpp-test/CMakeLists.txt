@@ -11,6 +11,8 @@ function(add_mscclpp_test_executable name sources)
     add_executable(${name} ${sources} common.cc)
     target_link_libraries(${name} ${TEST_LIBS_COMMON} MPI::MPI_CXX nlohmann_json::nlohmann_json)
     target_include_directories(${name} ${TEST_INC_COMMON})
+    # Required for __shfl_down_sync operation in reducescatter9
+    target_compile_definitions(${name} PRIVATE HIP_ENABLE_WARP_SYNC_BUILTINS=1)
 endfunction()
 
 add_mscclpp_test_executable(sendrecv_test_perf sendrecv_test.cu)
