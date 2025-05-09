@@ -18,6 +18,8 @@
 constexpr int NRANKS = 8;
 constexpr int NPEERS = NRANKS - 1;
 constexpr int CHUNK_SIZE_KB = 256;
+constexpr int MAX_BLOCKS = 56;
+const size_t SCRATCH_BUFF_SIZE = CHUNK_SIZE_KB * 1024 * MAX_BLOCKS * NRANKS * 2;
 
 template <class T>
 using DeviceHandle = mscclpp::DeviceHandle<T>;
@@ -297,11 +299,11 @@ __global__ void __launch_bounds__(1024, 1)
     }
   }
 
-  __syncthreads();
-  if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
-    scratchChans[threadIdx.x].signal();
-    scratchChans[threadIdx.x].wait();
-  }
+    __syncthreads();
+    if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
+      scratchChans[threadIdx.x].signal();
+      scratchChans[threadIdx.x].wait();
+    }
 
 }
 
@@ -338,110 +340,57 @@ __global__ void __launch_bounds__(1024, 1)
   } else if (blockIdx.x == nNeededBlocks - 1) {
     nInt4OfThisBlock = nInt4PerRank - maxNInt4PerBlock * (nNeededBlocks - 1);
   }
-
-  uint32_t prodFlag = 0;
-  uint32_t conFlag = 0;
+  
   const size_t nItrs = nInt4OfThisBlock / nInt4PerChunk;
   const size_t restNInt4 = nInt4OfThisBlock % nInt4PerChunk;
-  const size_t chunkSizePerRank = nNeededBlocks * nInt4PerChunk;
-  const size_t blockOffset = nInt4PerChunk * blockIdx.x;
-  size_t scratchBaseOffsetInt4 = 0;
+  const size_t scratchBaseOffsetInt4 = blockIdx.x * nInt4PerChunk * worldSize;
 
   if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
     scratchChans[threadIdx.x].relaxedSignal();
     scratchChans[threadIdx.x].wait();
   }
-  __syncthreads();
 
-  // pre-push
-  size_t nInt4PrePush = (nItrs != 0) ? nInt4PerChunk : restNInt4;
-  for (size_t idx = threadIdx.x; idx < nInt4PrePush; idx += blockDim.x) {
-    #pragma unroll
-    for (size_t peerIdx = 0; peerIdx < NPEERS; peerIdx++) {
-      const int remoteRank = (peerIdx < rank) ? peerIdx : peerIdx + 1;
-      int4 val = buff4[nInt4PerRank * remoteRank + offsetOfThisBlock + idx];
-      scratchChans[peerIdx].write(scratchBaseOffsetInt4 + (nInt4PerChunk * rank)  + idx, val);
-    }
-  }
-  prodFlag = !prodFlag;
-  __syncthreads();
-  if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
-    scratchChans[threadIdx.x].signal();
-  }
-
-  size_t nextOffsetOfThisBlock = offsetOfThisBlock + nInt4PerChunk;
-
-  for (size_t i = 0; i < nItrs; ++i) {
+  const size_t nChunksToProcess = nItrs + (restNInt4 != 0);
+  for (size_t i = 0; i < nChunksToProcess; ++i) {
+    __syncthreads();
     // Write to remote peers
-    size_t nInt4NextPush = (i+1 == nItrs) ? restNInt4 : nInt4PerChunk;
-    if (nInt4NextPush != 0) {
-      scratchBaseOffsetInt4 = (prodFlag) ? (worldSize * nInt4PerChunk) : 0;
 
-      for (size_t idx = threadIdx.x; idx < nInt4NextPush; idx += blockDim.x) {
-        #pragma unroll
-        for (size_t peerIdx = 0; peerIdx < NPEERS; peerIdx++) {
-          const int remoteRank = (peerIdx < rank) ? peerIdx : peerIdx + 1;
-          int4 val = buff4[nInt4PerRank * remoteRank + nextOffsetOfThisBlock + idx];
-          scratchChans[peerIdx].write(scratchBaseOffsetInt4 + (nInt4PerChunk * rank) + idx, val);
-        }
-      }
-    }
-
-    prodFlag = !prodFlag;
-    if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
-      scratchChans[threadIdx.x].wait();
-    }
-    __syncthreads();
-    if (nInt4NextPush != 0) {
-      if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
-        scratchChans[threadIdx.x].signal();
-      }
-    }
-
-    // Read from scratch, reduce, and write to result
-    scratchBaseOffsetInt4 = (conFlag) ? (worldSize * nInt4PerChunk) : 0;
-    for (size_t idx = threadIdx.x; idx < nInt4PerChunk; idx += blockDim.x) {
-      int4 data = buff4[nInt4PerRank * rank + offsetOfThisBlock + idx];
+    const size_t nInt4ThisItr = (i == nItrs) ? restNInt4 : nInt4PerChunk;
+    for (size_t idx = threadIdx.x; idx < nInt4ThisItr; idx += blockDim.x) {
       #pragma unroll
       for (size_t peerIdx = 0; peerIdx < NPEERS; peerIdx++) {
         const int remoteRank = (peerIdx < rank) ? peerIdx : peerIdx + 1;
-        int4 val = scratch4[scratchBaseOffsetInt4 + (nInt4PerChunk * remoteRank) + idx];
-        data = add_vectors<int>(val, data);
+        int4 val = buff4[nInt4PerRank * remoteRank + offsetOfThisBlock + idx];
+        scratchChans[peerIdx].write(scratchBaseOffsetInt4 + (nInt4PerChunk * rank) + idx, val);
       }
-      resultBuff4[offsetOfThisBlock + idx] = data;
     }
-     offsetOfThisBlock += nInt4PerChunk;
-     nextOffsetOfThisBlock += nInt4PerChunk;
-     conFlag = !conFlag;
-  }
-
-  if (restNInt4 > 0) {
-    //Syncrhonize writes to scratch
-    if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
-      // scratchChans[threadIdx.x].signal();
-      scratchChans[threadIdx.x].wait();
-    }
-    __syncthreads();
-
-
-    scratchBaseOffsetInt4 = (conFlag) ? (worldSize * nInt4PerChunk) : 0;
-    for (size_t idx = threadIdx.x; idx < restNInt4; idx += blockDim.x) {
-      int4 data = buff4[nInt4PerRank * rank + offsetOfThisBlock + idx];
-      #pragma unroll
-      for (size_t peerIdx = 0; peerIdx < NPEERS; peerIdx++) {
-        const int remoteRank = (peerIdx < rank) ? peerIdx : peerIdx + 1;
-        int4 val = scratch4[scratchBaseOffsetInt4 + (nInt4PerChunk * remoteRank) + idx];
-        data = add_vectors<int>(val, data);
-      }
-      resultBuff4[offsetOfThisBlock + idx] = data;
-    }
-  }
 
     __syncthreads();
     if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
       scratchChans[threadIdx.x].signal();
       scratchChans[threadIdx.x].wait();
     }
+    __syncthreads();
+
+    // Read from scratch, reduce, and write to result
+    for (size_t idx = threadIdx.x; idx < nInt4ThisItr; idx += blockDim.x) {
+      int4 data = buff4[nInt4PerRank * rank + offsetOfThisBlock + idx];
+      #pragma unroll
+      for (size_t peerIdx = 0; peerIdx < NPEERS; peerIdx++) {
+        const int remoteRank = (peerIdx < rank) ? peerIdx : peerIdx + 1;
+        int4 val = scratch4[scratchBaseOffsetInt4 + (nInt4PerChunk * remoteRank) + idx];
+        data = add_vectors<int>(val, data);
+      }
+      resultBuff4[offsetOfThisBlock + idx] = data;
+    }
+    offsetOfThisBlock += nInt4PerChunk;
+
+    __syncthreads();
+    if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
+      scratchChans[threadIdx.x].signal();
+      scratchChans[threadIdx.x].wait();
+    }
+  }
 }
 
 // Experimental pull-based implementation
@@ -608,14 +557,20 @@ void ReduceScatterTestColl::runColl(const TestArgs& args, cudaStream_t stream) {
     nBlocks = 48;
     nThreads = 512;
   } else if (kernelNum == 7) {
-    nBlocks = 32;
-    nThreads = 1024;
+    nBlocks = 56;
+    nThreads = 512;
   } else if (kernelNum == 9) {
     nBlocks = 16;
     nThreads = 512;//(WARP_SIZE);
   } else {
     nBlocks = 1;
     nThreads = WARP_SIZE * (worldSize - 1);
+  }
+  if (nBlocks > MAX_BLOCKS) {
+    std::stringstream err;
+    err << "runColl invalid nBlocks " << nBlocks << " cannot be larger than " << MAX_BLOCKS;
+    throw mscclpp::Error(err.str(), mscclpp::ErrorCode::InvalidUsage);
+    return;
   }
   if (kernelNum == 5) {
     reducescatter5<<<nBlocks, nThreads, 0, stream>>>((int*)inputBuff, (int*)outputBuff, rank, worldSize, nRanksPerNode,
@@ -635,11 +590,16 @@ void ReduceScatterTestColl::initData(const TestArgs& args, std::vector<void*> se
   if (sendBuff.size() != 1) std::runtime_error("unexpected error");
   const int rank = args.rank;
   const int worldSize = args.totalRanks;
-  std::vector<int> dataHost(std::max(sendCount_, recvCount_), rank);
+  std::vector<int> dataHost(sendCount_);
+  for (int r = 0; r < worldSize; r++) {
+    for (size_t i = 0; i < recvCount_; i++) {
+      dataHost[r *recvCount_ + i] = rank + i;
+    }
+  }
   CUDATHROW(cudaMemcpy(sendBuff[0], dataHost.data(), sendCount_ * typeSize_, cudaMemcpyHostToDevice));
 
   for (size_t i = 0; i < recvCount_; i++) {
-    dataHost[i] = worldSize * (worldSize - 1) / 2;
+    dataHost[i] = worldSize * (worldSize - 1) / 2 + (i * worldSize);
   }
   std::memcpy(expectedBuff, dataHost.data(), recvCount_ * typeSize_);
 }
@@ -692,7 +652,7 @@ class ReduceScatterTestEngine : public BaseTestEngine {
   void* getExpectedBuff() override;
 
   std::shared_ptr<int> sendBuff_;
-  std::shared_ptr<int> scratchBuff_;
+  std::shared_ptr<char> scratchBuff_;
   std::shared_ptr<int> resultBuff_;
   std::shared_ptr<int[]> expectedBuff_;
   std::shared_ptr<mscclpp::LLPacket> scratchPacketBuff_;
@@ -718,7 +678,7 @@ void ReduceScatterTestEngine::allocateBuffer() {
   expectedBuff_ = std::shared_ptr<int[]>(new int[args_.maxBytes / NRANKS / sizeof(int)]);
 
   if (args_.kernelNum == 6 || args_.kernelNum == 7) {
-    scratchBuff_ = mscclpp::GpuBuffer<int>(args_.maxBytes / sizeof(int)).memory();
+    scratchBuff_ = mscclpp::GpuBuffer<char>(SCRATCH_BUFF_SIZE).memory();
     scratchBuff = scratchBuff_.get();
   }
 }
