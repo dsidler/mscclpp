@@ -401,7 +401,7 @@ void BaseTestEngine::setupMeshConnections(std::vector<DeviceHandle<mscclpp::Port
                                           void* inputBuff, size_t inputBuffBytes, void* outputBuff,
                                           size_t outputBuffBytes, SetupChannelFunc setupChannel) {
   mscclpp::TransportFlags allTransports = mscclpp::Transport::CudaIpc;
-  if (mscclpp::getIBDeviceCount() > 0) allTransports |= IBs[args_.gpuNum];
+  //if (mscclpp::getIBDeviceCount() > 0) allTransports |= IBs[args_.gpuNum];
   mscclpp::RegisteredMemory inputBufRegMem = comm_->registerMemory(inputBuff, inputBuffBytes, allTransports);
   mscclpp::RegisteredMemory outputBufRegMem;
   if (outputBuff) {
@@ -432,7 +432,7 @@ void BaseTestEngine::setupMeshConnections(std::vector<mscclpp::MemoryChannel>& m
                                           size_t inputBuffBytes, void* outputBuff, size_t outputBuffBytes,
                                           ChannelSemantic semantic, size_t nChannelPerConnection) {
   mscclpp::TransportFlags allTransports = mscclpp::Transport::CudaIpc;
-  if (mscclpp::getIBDeviceCount() > 0) allTransports |= IBs[args_.gpuNum];
+  //if (mscclpp::getIBDeviceCount() > 0) allTransports |= IBs[args_.gpuNum];
   mscclpp::RegisteredMemory inputBufRegMem = comm_->registerMemory(inputBuff, inputBuffBytes, allTransports);
   mscclpp::RegisteredMemory getPacketBufRegMem;
   mscclpp::RegisteredMemory outputBufRegMem;
@@ -474,7 +474,7 @@ void BaseTestEngine::setupMeshConnections(std::vector<mscclpp::MemoryChannel>& m
                                           size_t putPacketBuffBytes, void* getPacketBuff, size_t getPacketBuffBytes,
                                           void* outputBuff, size_t outputBuffBytes) {
   mscclpp::TransportFlags allTransports = mscclpp::Transport::CudaIpc;
-  if (mscclpp::getIBDeviceCount() > 0) allTransports |= IBs[args_.gpuNum];
+  //if (mscclpp::getIBDeviceCount() > 0) allTransports |= IBs[args_.gpuNum];
   mscclpp::RegisteredMemory inputBufRegMem = comm_->registerMemory(inputBuff, inputBuffBytes, allTransports);
   mscclpp::RegisteredMemory putPacketBufRegMem;
   mscclpp::RegisteredMemory getPacketBufRegMem;
